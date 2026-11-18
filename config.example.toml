@@ -1,0 +1,15 @@
+# The transcript directory on the Perch engine's machine.
+# output_dir = "/home/you/.perch/knowledge/discord"
+
+backfill_days = 30
+reconcile_days = 7
+
+[[channels]]
+server_id = "123456789012345678"
+channel_id = "234567890123456789"
+path = "slatedb/dev"
+
+[[channels]]
+server_id = "123456789012345678"
+channel_id = "345678901234567890"
+path = "slatedb/releases"

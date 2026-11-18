@@ -1,0 +1,12 @@
+[Unit]
+Description=Export Discord messages to Markdown for Perch
+
+[Service]
+EnvironmentFile=%E/discord-md/token.env
+ExecStart=%h/.local/share/discord-md/venv/bin/discord-md
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+
+[Install]
+WantedBy=default.target
