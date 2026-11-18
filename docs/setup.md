@@ -48,10 +48,10 @@ dir = "discord/slatedb"
 repos = ["slatedb/slatedb", "slatedb/slatedb-go"]
 ```
 
-Start a new Perch agent session to pick up the directory. discord-md writes to `~/.perch/knowledge/discord` by default. Set `output_dir` to the corresponding directory if the engine uses a different Perch home. Each project has an `INDEX.md` that links to daily channel transcripts and files for public threads and forum posts. Messages include their author, UTC time, and Discord link. The export includes reply links and attachment names.
+Start a new Perch agent session to pick up the directory. discord-md writes to `~/.perch/knowledge/discord` by default. Set `output_dir` to the corresponding directory if the engine uses a different Perch home. Each project has an `INDEX.md` that links to daily channel transcripts and files for public threads and forum posts. Messages include their author, UTC time, and Discord link. The export includes reply links and attachment names. Keep these paths free for the generated files.
 
 ## History and recovery
 
-discord-md imports 30 days of message history and follows readable public threads in configured channels. It applies new messages, edits, and deletions as Discord sends them.
+discord-md imports 30 days of message history and follows readable public threads in configured channels. It applies new messages, edits, and deletions as Discord sends them. On each sync it checks active threads, recently archived threads, and threads it already tracks.
 
-The bot keeps its sync position and message data in `$XDG_STATE_HOME/discord-md/archive.sqlite3` or `~/.local/state/discord-md/archive.sqlite3`. After reconnecting, it fetches newer messages and rechecks the last seven days for changes it missed. Offline edits and deletions to older messages need a wider recheck. Set `backfill_days` and `reconcile_days` in `config.toml` to change these windows.
+The bot keeps its sync position and message data in `$XDG_STATE_HOME/discord-md/archive.sqlite3` or `~/.local/state/discord-md/archive.sqlite3`. After reconnecting, it fetches messages newer than the saved position in each tracked channel and thread. It also rechecks the last seven days for missed edits and deletes. Offline changes to older messages need a wider recheck. Set `backfill_days` and `reconcile_days` in `config.toml` to change these windows. For threads the bot has yet to track, it looks back by the longer of the two windows to find archived threads.

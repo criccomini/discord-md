@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "discord-md"
+version = "0.1.0"
+description = "Export Discord conversations to Perch as Markdown"
+requires-python = ">=3.11"
+dependencies = ["discord.py>=2.5,<3"]
+
+[project.scripts]
+discord-md = "discord_md.bot:main"
+
+[tool.setuptools]
+packages = ["discord_md"]
