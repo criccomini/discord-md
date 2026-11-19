@@ -48,7 +48,7 @@ dir = "discord/slatedb"
 repos = ["slatedb/slatedb", "slatedb/slatedb-go"]
 ```
 
-Start a new Perch agent session to pick up the directory. discord-md writes to `~/.perch/knowledge/discord` by default. Set `output_dir` to the corresponding directory if the engine uses a different Perch home. Each project has an `INDEX.md` that lists daily channel transcripts and public threads or forum posts newest first. Messages show their author, UTC time, Discord link, readable mentions, reply links, attachment names, forwarded text, and rich embeds. Keep these paths free for the generated files.
+Start a new Perch agent session to pick up the directory. discord-md writes to `~/.perch/knowledge/discord` by default. Set `output_dir` to the corresponding directory if the engine uses a different Perch home. Each project has an `INDEX.md` that lists daily channel transcripts and public threads or forum posts newest first. Messages show their author, UTC time, Discord link, readable mentions, reply links, attachment names, forwarded text, and rich embeds. Forwarded text shows a channel, role, or member name only if the bot has it in its cache for the server. Otherwise it keeps the Discord ID. Keep these paths free for the generated files.
 
 ## History and recovery
 

@@ -25,7 +25,11 @@ class SyncTest(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.db.close)
         self.archive = Archive(self.db, self.settings)
         self.bot = Bot(self.settings, self.archive)
-        self.channel = Mock(spec=discord.TextChannel, id=2, guild=SimpleNamespace(id=1, me=object()))
+        guild = SimpleNamespace(
+            id=1, me=object(), get_channel_or_thread=lambda id_: self.channel,
+            get_role=lambda id_: None, get_member=lambda id_: None,
+        )
+        self.channel = Mock(spec=discord.TextChannel, id=2, guild=guild)
         self.channel.name = "dev"
         self.channel.permissions_for.return_value = discord.Permissions(view_channel=True, read_message_history=True)
         self.now = discord.utils.utcnow()
@@ -33,7 +37,7 @@ class SyncTest(unittest.IsolatedAsyncioTestCase):
     def message(self, age, content, *, channel=None, clean=None, embeds=(), snapshots=(), reference=None):
         created = self.now - age
         return SimpleNamespace(
-            id=discord.utils.time_snowflake(created), channel=channel or self.channel,
+            id=discord.utils.time_snowflake(created), channel=channel or self.channel, guild=self.channel.guild,
             created_at=created, edited_at=None, author=SimpleNamespace(display_name="Alice"),
             content=content, clean_content=content if clean is None else clean,
             embeds=list(embeds), message_snapshots=list(snapshots),
@@ -101,7 +105,7 @@ class SyncTest(unittest.IsolatedAsyncioTestCase):
             embeds=[release, link_preview],
         ))
         forward = SimpleNamespace(
-            content="Original note", embeds=[], attachments=[SimpleNamespace(filename="trace.log")],
+            content="Original note in <#2> for <@42>", embeds=[], attachments=[SimpleNamespace(filename="trace.log")],
         )
         forward_ref = discord.MessageReference(
             message_id=99, channel_id=88, type=discord.MessageReferenceType.forward,
@@ -121,7 +125,7 @@ class SyncTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("@Bob check https://example.com", page)
             self.assertIn("v0.5.0\nFaster reads", page)
             self.assertNotIn("Skip preview", page)
-            self.assertIn("Forwarded:\nOriginal note\n\nAttachments: trace.log", page)
+            self.assertIn("Forwarded:\nOriginal note in #dev for <@42>\n\nAttachments: trace.log", page)
             self.assertNotIn("[Reply to message]", page)
         finally:
             task.cancel()

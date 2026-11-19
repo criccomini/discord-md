@@ -4,6 +4,7 @@ import fcntl
 import inspect
 import logging
 import os
+import re
 import sqlite3
 from contextlib import closing
 from functools import partial
@@ -257,9 +258,19 @@ def snowflake_days_ago(days: int) -> int:
 
 
 def message_text(message) -> str:
+    def mention_name(match) -> str:
+        # Discord sends no mention details with a forward. Names come from the cache of this server.
+        guild = message.guild
+        find = {"#": guild.get_channel_or_thread, "@&": guild.get_role}.get(match[1], guild.get_member)
+        found = find(int(match[2]))
+        return f"{match[1][0]}{getattr(found, 'display_name', None) or found.name}" if found else match[0]
+
     parts = []
     items = [(message.clean_content, message.embeds, "")]
-    items.extend((snapshot.content, snapshot.embeds, "Forwarded:\n") for snapshot in message.message_snapshots)
+    items.extend(
+        (re.sub(r"<(@&|@!?|#)(\d+)>", mention_name, snapshot.content), snapshot.embeds, "Forwarded:\n")
+        for snapshot in message.message_snapshots
+    )
     for content, embeds, prefix in items:
         has_text = bool(content.strip())
         lines = [content] if has_text else []
