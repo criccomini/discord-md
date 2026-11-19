@@ -235,17 +235,21 @@ class Archive:
                 parent = streams.get(id_)
                 title = parent.title if parent and parent.server_id == source.server_id else source.path.name
                 lines.extend(["", f"## {label(title)}", ""])
-                thread_ids = [row[0] for row in self.db.execute(
-                    "SELECT id FROM streams WHERE source_id = ? AND id != source_id AND cursor IS NOT NULL ORDER BY id",
-                    (id_,),
-                )]
-                for stream_id in [id_, *thread_ids]:
-                    stream = streams.get(stream_id)
-                    if stream is None or stream.server_id != source.server_id:
-                        continue
-                    for _, day in self.pages(stream_id):
-                        path = source.path.name / page_name(stream_id, day)
-                        lines.append(f"- [{day or label(stream.title)}]({path.as_posix()})")
+                if parent and parent.server_id == source.server_id:
+                    for _, day in self.pages(id_):
+                        path = source.path.name / page_name(id_, day)
+                        lines.append(f"- [{day}]({path.as_posix()})")
+                for stream_id, latest_day in self.db.execute("""
+                    SELECT messages.stream_id, substr(max(messages.created), 1, 10)
+                    FROM messages JOIN streams ON streams.id = messages.stream_id
+                    WHERE streams.source_id = ? AND streams.id != streams.source_id
+                        AND streams.server_id = ? AND streams.cursor IS NOT NULL
+                    GROUP BY messages.stream_id
+                    ORDER BY max(messages.id) DESC
+                """, (id_, source.server_id)):
+                    stream = streams[stream_id]
+                    path = source.path.name / page_name(stream_id, "")
+                    lines.append(f"- [{label(stream.title)}]({path.as_posix()}) · {latest_day}")
             index = Path(project) / "INDEX.md"
             self.write(index, "\n".join(lines).rstrip() + "\n", written)
             expected.add(index)

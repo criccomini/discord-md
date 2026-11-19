@@ -63,9 +63,10 @@ class Bot(discord.Client):
         data = event.data
         edited = discord.utils.parse_time(data.get("edited_timestamp"))
         if edited and ("content" in data or "attachments" in data):
-            attachments = ", ".join(file["filename"] for file in data["attachments"]) if "attachments" in data else None
+            content = message_text(event.message) if "content" in data else None
+            attachments = message_attachments(event.message) if "attachments" in data else None
             self.jobs.put_nowait(partial(
-                self.archive.edit, event.message_id, data.get("content"), attachments, edited.timestamp(),
+                self.archive.edit, event.message_id, content, attachments, edited.timestamp(),
             ))
 
     async def on_raw_message_delete(self, event):
@@ -249,15 +250,39 @@ def snowflake_days_ago(days: int) -> int:
     return max(0, discord.utils.time_snowflake(discord.utils.utcnow()) - days * DAY_IN_SNOWFLAKES)
 
 
+def message_text(message) -> str:
+    parts = []
+    items = [(message.clean_content, message.embeds, "")]
+    items.extend((snapshot.content, snapshot.embeds, "Forwarded:\n") for snapshot in message.message_snapshots)
+    for content, embeds, prefix in items:
+        has_text = bool(content.strip())
+        lines = [content] if has_text else []
+        for embed in embeds:
+            if has_text and embed.type not in (None, "rich"):
+                continue
+            lines.extend(line for line in (embed.title, embed.url, embed.description) if line)
+            lines.extend(f"{field.name}: {field.value}" for field in embed.fields if field.name or field.value)
+        if lines:
+            parts.append(prefix + "\n".join(lines))
+    return "\n\n".join(parts)
+
+
+def message_attachments(message) -> str:
+    files = [*message.attachments, *(file for snapshot in message.message_snapshots for file in snapshot.attachments)]
+    return ", ".join(file.filename for file in files)
+
+
 def message_record(message: discord.Message) -> Message:
     edit = message.edited_at
+    ref = message.reference
+    reply = ref.jump_url if ref and ref.message_id and ref.type != discord.MessageReferenceType.forward else ""
     return Message(
         message.id,
         message.created_at.isoformat(timespec="seconds").replace("+00:00", "Z"),
         message.author.display_name,
-        message.content,
-        message.reference.jump_url if message.reference and message.reference.message_id else "",
-        ", ".join(file.filename for file in message.attachments),
+        message_text(message),
+        reply,
+        message_attachments(message),
         edit.timestamp() if edit else 0,
     )
 

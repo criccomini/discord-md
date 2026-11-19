@@ -30,12 +30,14 @@ class SyncTest(unittest.IsolatedAsyncioTestCase):
         self.channel.permissions_for.return_value = discord.Permissions(view_channel=True, read_message_history=True)
         self.now = discord.utils.utcnow()
 
-    def message(self, age, content, *, channel=None):
+    def message(self, age, content, *, channel=None, clean=None, embeds=(), snapshots=(), reference=None):
         created = self.now - age
         return SimpleNamespace(
             id=discord.utils.time_snowflake(created), channel=channel or self.channel,
             created_at=created, edited_at=None, author=SimpleNamespace(display_name="Alice"),
-            content=content, is_system=lambda: False, reference=None, attachments=[],
+            content=content, clean_content=content if clean is None else clean,
+            embeds=list(embeds), message_snapshots=list(snapshots),
+            is_system=lambda: False, reference=reference, attachments=[],
         )
 
     async def test_reconnect_reconciles_recent_history_and_recovers_new_messages(self):
@@ -59,7 +61,7 @@ class SyncTest(unittest.IsolatedAsyncioTestCase):
         # Checkpoint only REST history. Receiving a newer live message cannot skip the gap.
         self.assertEqual(self.db.execute("SELECT cursor FROM streams").fetchone(), (deleted.id,))
         edited.edited_at = self.now
-        edited.content = "After edit"
+        edited.content = edited.clean_content = "After edit"
         remote[:] = [edited, missed, latest]
         await self.bot.sync_channel(self.channel)
         self.archive.publish()
@@ -88,38 +90,75 @@ class SyncTest(unittest.IsolatedAsyncioTestCase):
         await self.bot.on_raw_message_edit(SimpleNamespace(
             guild_id=1, message_id=posts[2].id,
             data={"edited_timestamp": self.now.isoformat(), "content": "```rust\nfn main() {}\n```"},
+            message=SimpleNamespace(
+                clean_content="```rust\nfn main() {}\n```", embeds=[], message_snapshots=[], attachments=[],
+            ),
+        ))
+        release = discord.Embed(title="v0.5.0", description="Faster reads")
+        link_preview = discord.Embed.from_dict({"type": "link", "title": "Skip preview"})
+        await self.bot.on_message(self.message(
+            timedelta(seconds=2), "<@42> check https://example.com", clean="@Bob check https://example.com",
+            embeds=[release, link_preview],
+        ))
+        forward = SimpleNamespace(
+            content="Original note", embeds=[], attachments=[SimpleNamespace(filename="trace.log")],
+        )
+        forward_ref = discord.MessageReference(
+            message_id=99, channel_id=88, type=discord.MessageReferenceType.forward,
+        )
+        await self.bot.on_message(self.message(
+            timedelta(seconds=1), "", snapshots=[forward], reference=forward_ref,
         ))
         drained = asyncio.Event()
         self.bot.jobs.put_nowait(drained.set)
         task = asyncio.create_task(self.bot.work())
         try:
             await asyncio.wait_for(drained.wait(), timeout=5)
-            self.assertEqual(self.db.execute("SELECT count(*) FROM messages").fetchone(), (203,))
-            page = self.root / "project/dev" / f"{posts[2].created_at.date()}.md"
-            self.assertIn("````text\n```rust\nfn main() {}\n```\n````", page.read_text())
-            self.assertIn(f"https://discord.com/channels/1/2/{posts[2].id}", page.read_text())
+            self.assertEqual(self.db.execute("SELECT count(*) FROM messages").fetchone(), (205,))
+            page = (self.root / "project/dev" / f"{posts[2].created_at.date()}.md").read_text()
+            self.assertIn("````text\n```rust\nfn main() {}\n```\n````", page)
+            self.assertIn(f"https://discord.com/channels/1/2/{posts[2].id}", page)
+            self.assertIn("@Bob check https://example.com", page)
+            self.assertIn("v0.5.0\nFaster reads", page)
+            self.assertNotIn("Skip preview", page)
+            self.assertIn("Forwarded:\nOriginal note\n\nAttachments: trace.log", page)
+            self.assertNotIn("[Reply to message]", page)
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
     async def test_rebuild_removes_deleted_thread_page(self):
+        older = Mock(spec=discord.Thread, id=4, guild=self.channel.guild, parent_id=2, parent=None)
+        older.name = "Older notes"
+        older.is_private.return_value = False
+        older_msg = self.message(timedelta(days=2), "Old post", channel=older)
         thread = Mock(spec=discord.Thread, id=3, guild=self.channel.guild, parent_id=2, parent=None)
         thread.name = "Design notes"
         thread.is_private.return_value = False
         message = self.message(timedelta(seconds=1), "Thread post", channel=thread)
 
+        async def older_history(**options):
+            yield older_msg
+
         async def history(**options):
             yield message
 
+        older.history = older_history
         thread.history = history
+        await self.bot.sync_channel(older, self.channel)
         await self.bot.sync_channel(thread, self.channel)
         self.archive.publish()
         page = self.root / "project/dev/threads/3.md"
         index = self.root / "project/INDEX.md"
-        self.assertIn("[Design notes](dev/threads/3.md)", index.read_text())
+        index_text = index.read_text()
+        new_entry = f"[Design notes](dev/threads/3.md) · {message.created_at.date()}"
+        old_entry = f"[Older notes](dev/threads/4.md) · {older_msg.created_at.date()}"
+        self.assertIn(new_entry, index_text)
+        self.assertIn(old_entry, index_text)
+        self.assertLess(index_text.index(new_entry), index_text.index(old_entry))
         self.assertTrue(page.exists())
 
-        self.archive.delete({message.id})
+        self.archive.delete({message.id, older_msg.id})
         # Recover if the process stops after the database commit but before the export.
         Archive(self.db, self.settings).publish(rebuild=True)
         self.assertFalse(page.exists())
