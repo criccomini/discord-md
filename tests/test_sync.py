@@ -63,7 +63,7 @@ class SyncTest(unittest.IsolatedAsyncioTestCase):
         edited.edited_at = self.now
         edited.content = edited.clean_content = "After edit"
         remote[:] = [edited, missed, latest]
-        await self.bot.sync_channel(self.channel)
+        await self.bot.sync_channel(self.channel, reconcile=True)
         self.archive.publish()
         transcripts = "\n".join(path.read_text() for path in self.root.rglob("*.md"))
         for text in ("Outside recheck", "After edit", "Missed while away", "Live message after gap"):

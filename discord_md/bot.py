@@ -30,6 +30,7 @@ class Bot(discord.Client):
         self.archive = archive
         self.server_ids = {source.server_id for source in settings.sources.values()}
         self.jobs = asyncio.Queue()
+        self.reconcile = False
 
     def stream(self, channel) -> Stream | None:
         if isinstance(channel, discord.Thread) and not channel.is_private():
@@ -45,6 +46,8 @@ class Bot(discord.Client):
 
     async def on_ready(self):
         LOG.info("Connected to Discord as %s", self.user)
+        # Discord does not replay events from before a new session.
+        self.reconcile = True
         self.jobs.put_nowait(self.sync)
 
     async def on_resumed(self):
@@ -105,7 +108,7 @@ class Bot(discord.Client):
     def backfill_floor(self) -> int:
         return snowflake_days_ago(self.settings.backfill_days)
 
-    async def sync_channel(self, channel, parent=None) -> None:
+    async def sync_channel(self, channel, parent=None, reconcile=False) -> None:
         stream = self.stream(channel)
         if stream is None:
             return
@@ -121,7 +124,9 @@ class Bot(discord.Client):
             cursor = saved[1] if saved else backfill_floor
         else:
             floor, cursor = saved
-            after = max(floor, min(cursor, snowflake_days_ago(self.settings.reconcile_days)))
+            after = cursor
+            if reconcile:
+                after = max(floor, min(cursor, snowflake_days_ago(self.settings.reconcile_days)))
 
         messages = []
         seen = set()
@@ -137,6 +142,7 @@ class Bot(discord.Client):
         )
 
     async def sync(self) -> None:
+        reconcile, self.reconcile = self.reconcile, False
         active_by_server = {}
         backfill_floor = self.backfill_floor()
         reconcile_cutoff = snowflake_days_ago(self.settings.reconcile_days)
@@ -153,7 +159,7 @@ class Bot(discord.Client):
                     LOG.warning("Cannot read text or forum channel %s in server %s", id_, guild.id)
                     continue
                 if isinstance(channel, discord.TextChannel):
-                    await self.sync_channel(channel)
+                    await self.sync_channel(channel, reconcile=reconcile)
                 else:
                     self.archive.register(self.stream(channel), backfill_floor)
             except discord.NotFound:
@@ -183,7 +189,7 @@ class Bot(discord.Client):
                 try:
                     thread = threads.get(thread_id) or await guild.fetch_channel(thread_id)
                     if isinstance(thread, discord.Thread) and self.stream(thread):
-                        await self.sync_channel(thread, channel)
+                        await self.sync_channel(thread, channel, reconcile)
                 except discord.NotFound:
                     self.archive.drop_stream(thread_id)
                 except NETWORK_ERRORS as error:
