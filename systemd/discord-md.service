@@ -1,5 +1,7 @@
 [Unit]
 Description=Export Discord messages to Markdown for Perch
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 EnvironmentFile=%E/discord-md/token.env

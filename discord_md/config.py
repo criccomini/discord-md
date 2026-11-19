@@ -1,12 +1,7 @@
-import os
 import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-
-
-def user_dir(variable: str, default: str) -> Path:
-    return Path(os.environ.get(variable) or Path.home() / default) / "discord-md"
 
 
 @dataclass(frozen=True)

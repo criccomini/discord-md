@@ -50,31 +50,17 @@ class Archive:
             );
         """)
 
-    def register(self, stream: Stream, floor: int) -> tuple[int, int]:
-        changed = self.db.execute("""
+    def _register(self, stream: Stream, floor: int) -> bool:
+        return bool(self.db.execute("""
             INSERT INTO streams VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT (id) DO UPDATE SET title = excluded.title,
-                floor = coalesce(streams.floor, excluded.floor), cursor = coalesce(streams.cursor, excluded.cursor)
+                floor = coalesce(streams.floor, excluded.floor),
+                cursor = coalesce(streams.cursor, excluded.cursor)
             WHERE streams.title != excluded.title OR streams.cursor IS NULL RETURNING id
-        """, (stream.id, stream.source_id, stream.server_id, stream.title, floor, floor)).fetchone()
-        if changed:
-            self.dirty.update(self.pages(stream.id))
-            self.dirty_projects.add(self.sources[stream.source_id].path.parts[0])
-        return self.db.execute("SELECT floor, cursor FROM streams WHERE id = ?", (stream.id,)).fetchone()
+        """, (stream.id, stream.source_id, stream.server_id, stream.title, floor, floor)).fetchone())
 
-    def threads(self, source_id: int) -> set[int]:
-        return {row[0] for row in self.db.execute(
-            "SELECT id FROM streams WHERE source_id = ? AND id != source_id AND cursor IS NOT NULL", (source_id,)
-        )}
-
-    def pages(self, stream_id: int) -> list[tuple[int, str]]:
-        return self.db.execute(
-            "SELECT DISTINCT stream_id, day FROM messages WHERE stream_id = ? ORDER BY day DESC",
-            (stream_id,),
-        ).fetchall()
-
-    def save(self, stream: Stream, message: Message) -> None:
-        result = self.db.execute("""
+    def _upsert_message(self, stream: Stream, message: Message) -> tuple[int, str] | None:
+        return self.db.execute("""
             INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (id) DO UPDATE SET author = excluded.author, content = excluded.content,
                 reply = excluded.reply, attachments = excluded.attachments, edited = excluded.edited
@@ -86,34 +72,108 @@ class Archive:
             message.id, stream.id, message.created[:10] if stream.id == stream.source_id else "",
             message.created, message.author, message.content, message.reply, message.attachments, message.edited,
         )).fetchone()
-        if result:
-            self.dirty.add(result)
+
+    def _mark_stream(self, stream: Stream) -> None:
+        self.dirty.update(self.pages(stream.id))
+        self.dirty_projects.add(self.sources[stream.source_id].path.parts[0])
+
+    def stream_window(self, stream_id: int) -> tuple[int, int] | None:
+        return self.db.execute(
+            "SELECT floor, cursor FROM streams WHERE id = ? AND cursor IS NOT NULL", (stream_id,)
+        ).fetchone()
+
+    def tracked_threads(self, source_id: int, since: int, floor_after: int) -> set[int]:
+        return {row[0] for row in self.db.execute("""
+            SELECT id FROM streams
+            WHERE source_id = ? AND id != source_id AND cursor IS NOT NULL
+                AND (cursor >= ? OR (floor > ? AND id < floor))
+        """, (source_id, since, floor_after))}
+
+    def pages(self, stream_id: int) -> list[tuple[int, str]]:
+        return self.db.execute(
+            "SELECT DISTINCT stream_id, day FROM messages WHERE stream_id = ? ORDER BY day DESC",
+            (stream_id,),
+        ).fetchall()
+
+    def register(self, stream: Stream, floor: int) -> None:
+        with self.db:
+            changed = self._register(stream, floor)
+        if changed:
+            self._mark_stream(stream)
+
+    def save(self, stream: Stream, message: Message, floor: int) -> None:
+        with self.db:
+            changed = self._register(stream, floor)
+            saved = self._upsert_message(stream, message)
+        if changed:
+            self._mark_stream(stream)
+        if saved:
+            self.dirty.add(saved)
+
+    def sync_stream(
+        self, stream: Stream, floor: int, after: int, cursor: int,
+        messages: list[Message], seen: set[int], *, complete: bool,
+    ) -> None:
+        dirty = set()
+        with self.db:
+            changed = self._register(stream, floor)
+            for message in messages:
+                saved = self._upsert_message(stream, message)
+                if saved:
+                    dirty.add(saved)
+            if complete:
+                stored = {row[0] for row in self.db.execute(
+                    "SELECT id FROM messages WHERE stream_id = ? AND id > ?", (stream.id, after)
+                )}
+                for message_id in stored - seen:
+                    deleted = self.db.execute(
+                        "DELETE FROM messages WHERE id = ? RETURNING stream_id, day", (message_id,)
+                    ).fetchone()
+                    if deleted:
+                        dirty.add(deleted)
+                self.db.execute(
+                    "UPDATE streams SET floor = min(coalesce(floor, ?), ?), cursor = ? WHERE id = ?",
+                    (floor, floor, cursor, stream.id),
+                )
+        if changed:
+            self._mark_stream(stream)
+        self.dirty.update(dirty)
 
     def edit(self, message_id: int, content: str | None, attachments: str | None, edited: float) -> None:
-        result = self.db.execute("""
-            UPDATE messages SET content = coalesce(?, content), attachments = coalesce(?, attachments), edited = ?
-            WHERE id = ? AND edited <= ? RETURNING stream_id, day
-        """, (content, attachments, edited, message_id, edited)).fetchone()
+        with self.db:
+            result = self.db.execute("""
+                UPDATE messages SET content = coalesce(?, content), attachments = coalesce(?, attachments), edited = ?
+                WHERE id = ? AND edited <= ? RETURNING stream_id, day
+            """, (content, attachments, edited, message_id, edited)).fetchone()
         if result:
             self.dirty.add(result)
 
     def delete(self, message_ids: set[int]) -> None:
-        for message_id in message_ids:
-            result = self.db.execute(
-                "DELETE FROM messages WHERE id = ? RETURNING stream_id, day", (message_id,)
-            ).fetchone()
-            if result:
-                self.dirty.add(result)
+        dirty = set()
+        with self.db:
+            for message_id in message_ids:
+                result = self.db.execute(
+                    "DELETE FROM messages WHERE id = ? RETURNING stream_id, day", (message_id,)
+                ).fetchone()
+                if result:
+                    dirty.add(result)
+        self.dirty.update(dirty)
 
     def drop_stream(self, stream_id: int, *, children: bool = False) -> None:
-        streams = {stream_id}
-        if children:
-            streams.update(self.threads(stream_id))
-        for id_ in streams:
-            self.db.execute("UPDATE streams SET cursor = NULL WHERE id = ?", (id_,))
-            self.dirty.update(self.db.execute(
-                "DELETE FROM messages WHERE stream_id = ? RETURNING stream_id, day", (id_,)
-            ).fetchall())
+        dirty = set()
+        with self.db:
+            streams = {stream_id}
+            if children:
+                streams.update(row[0] for row in self.db.execute(
+                    "SELECT id FROM streams WHERE source_id = ? AND id != source_id AND cursor IS NOT NULL",
+                    (stream_id,),
+                ))
+            for id_ in streams:
+                self.db.execute("UPDATE streams SET cursor = NULL WHERE id = ?", (id_,))
+                dirty.update(self.db.execute(
+                    "DELETE FROM messages WHERE stream_id = ? RETURNING stream_id, day", (id_,)
+                ).fetchall())
+        self.dirty.update(dirty)
 
     def publish(self, *, rebuild: bool = False) -> None:
         if rebuild:
@@ -130,7 +190,9 @@ class Archive:
             "SELECT id, source_id, server_id, title FROM streams"
         )}
         for stream_id, day in sorted(self.dirty):
-            stream = streams[stream_id]
+            stream = streams.get(stream_id)
+            if stream is None:
+                continue
             source = self.sources.get(stream.source_id)
             if source is None or source.server_id != stream.server_id:
                 continue
@@ -145,7 +207,21 @@ class Archive:
                 title = label(stream.title)
                 if day:
                     title += f" · {day}"
-                entries = [render_message(stream, Message(*row)) for row in rows]
+                entries = []
+                for row in rows:
+                    message = Message(*row)
+                    url = f"https://discord.com/channels/{stream.server_id}/{stream.id}/{message.id}"
+                    output = [f"## {label(message.author)} · [{message.created}]({url})", ""]
+                    if message.reply:
+                        output.extend([f"[Reply to message]({message.reply})", ""])
+                    body = message.content
+                    if message.attachments:
+                        body = f"{body}\n\nAttachments: {message.attachments}".strip()
+                    body = body.replace("\r\n", "\n").replace("\r", "\n")
+                    if body:
+                        fence = "`" * max(3, 1 + max((len(run) for run in re.findall(r"`+", body)), default=0))
+                        output.extend([f"{fence}text", body, fence, ""])
+                    entries.append("\n".join(output) + "\n")
                 self.write(path, f"# {title}\n\n{NOTICE}\n\n" + "\n".join(entries), written)
                 expected.add(path)
             elif path in written:
@@ -159,7 +235,11 @@ class Archive:
                 parent = streams.get(id_)
                 title = parent.title if parent and parent.server_id == source.server_id else source.path.name
                 lines.extend(["", f"## {label(title)}", ""])
-                for stream_id in [id_, *sorted(self.threads(id_))]:
+                thread_ids = [row[0] for row in self.db.execute(
+                    "SELECT id FROM streams WHERE source_id = ? AND id != source_id AND cursor IS NOT NULL ORDER BY id",
+                    (id_,),
+                )]
+                for stream_id in [id_, *thread_ids]:
                     stream = streams.get(stream_id)
                     if stream is None or stream.server_id != source.server_id:
                         continue
@@ -192,6 +272,7 @@ class Archive:
                 raise ValueError(f"Export path already contains a file the bot does not own: {target}")
             with self.db:
                 self.db.execute("INSERT INTO exports VALUES (?, ?)", (str(self.root), path.as_posix()))
+            written.add(path)
         if target.exists() and target.read_bytes() == data:
             return
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -205,9 +286,17 @@ class Archive:
                 temporary.unlink(missing_ok=True)
 
     def remove(self, path: Path) -> None:
-        self.destination(path).unlink(missing_ok=True)
+        target = self.destination(path)
+        target.unlink(missing_ok=True)
         with self.db:
             self.db.execute("DELETE FROM exports WHERE root = ? AND path = ?", (str(self.root), path.as_posix()))
+        parent = target.parent
+        while parent != self.root:
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
 
 
 def page_name(stream_id: int, day: str) -> Path:
@@ -216,17 +305,3 @@ def page_name(stream_id: int, day: str) -> Path:
 
 def label(text: str) -> str:
     return re.sub(r"([\\`*_{}\[\]()#+.!|<>])", r"\\\1", " ".join(text.split()))
-
-
-def render_message(stream: Stream, message: Message) -> str:
-    url = f"https://discord.com/channels/{stream.server_id}/{stream.id}/{message.id}"
-    output = [f"## {label(message.author)} · [{message.created}]({url})", ""]
-    if message.reply:
-        output.extend([f"[Reply to message]({message.reply})", ""])
-    body = message.content.replace("\r\n", "\n").replace("\r", "\n")
-    if message.attachments:
-        body = f"{body}\n\nAttachments: {message.attachments}".strip()
-    if body:
-        fence = "`" * max(3, 1 + max((len(run) for run in re.findall(r"`+", body)), default=0))
-        output.extend([f"{fence}text", body, fence, ""])
-    return "\n".join(output) + "\n"

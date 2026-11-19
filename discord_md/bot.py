@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import fcntl
+import inspect
 import logging
 import os
 import sqlite3
@@ -8,14 +9,16 @@ from contextlib import closing
 from functools import partial
 from pathlib import Path
 
+import aiohttp
 import discord
 
 from .archive import Archive, Message, Stream
-from .config import Settings, user_dir
+from .config import Settings
 
 LOG = logging.getLogger("discord-md")
 SYNC_INTERVAL = 3600
 SOURCE_CHANNELS = (discord.TextChannel, discord.ForumChannel)
+NETWORK_ERRORS = (discord.HTTPException, aiohttp.ClientError, OSError)
 DAY_IN_SNOWFLAKES = 86_400_000 << 22
 
 
@@ -50,7 +53,9 @@ class Bot(discord.Client):
     async def on_message(self, message):
         stream = self.stream(message.channel)
         if stream and not message.is_system():
-            self.jobs.put_nowait(partial(self.save_message, stream, message))
+            self.jobs.put_nowait(partial(
+                self.archive.save, stream, message_record(message), self.backfill_floor(),
+            ))
 
     async def on_raw_message_edit(self, event):
         if event.guild_id not in self.server_ids:
@@ -99,10 +104,6 @@ class Bot(discord.Client):
     def backfill_floor(self) -> int:
         return snowflake_days_ago(self.settings.backfill_days)
 
-    def save_message(self, stream: Stream, message: discord.Message) -> None:
-        self.archive.register(stream, self.backfill_floor())
-        self.archive.save(stream, message_record(message))
-
     async def sync_channel(self, channel, parent=None) -> None:
         stream = self.stream(channel)
         if stream is None:
@@ -112,26 +113,33 @@ class Bot(discord.Client):
         if not readable(parent or channel):
             return
 
-        db = self.archive.db
-        with db:
-            floor, cursor = self.archive.register(stream, self.backfill_floor())
+        backfill_floor = self.backfill_floor()
+        saved = self.archive.stream_window(stream.id)
+        if saved is None or backfill_floor < saved[0]:
+            floor = after = backfill_floor
+            cursor = saved[1] if saved else backfill_floor
+        else:
+            floor, cursor = saved
             after = max(floor, min(cursor, snowflake_days_ago(self.settings.reconcile_days)))
-            missing = {row[0] for row in db.execute(
-                "SELECT id FROM messages WHERE stream_id = ? AND id > ?", (stream.id, after)
-            )}
-            async for message in channel.history(limit=None, after=discord.Object(id=after), oldest_first=True):
-                cursor = max(cursor, message.id)
-                missing.discard(message.id)
-                if not message.is_system():
-                    self.archive.save(stream, message_record(message))
 
-            # Discord returns empty history if the bot loses Read Message History.
-            if readable(parent or channel):
-                self.archive.delete(missing)
-                db.execute("UPDATE streams SET cursor = ? WHERE id = ?", (cursor, stream.id))
+        messages = []
+        seen = set()
+        async for message in channel.history(limit=None, after=discord.Object(id=after), oldest_first=True):
+            cursor = max(cursor, message.id)
+            seen.add(message.id)
+            if not message.is_system():
+                messages.append(message_record(message))
+
+        # Discord returns empty history if the bot loses Read Message History.
+        self.archive.sync_stream(
+            stream, floor, after, cursor, messages, seen, complete=readable(parent or channel),
+        )
 
     async def sync(self) -> None:
         active_by_server = {}
+        backfill_floor = self.backfill_floor()
+        reconcile_cutoff = snowflake_days_ago(self.settings.reconcile_days)
+        cutoff = min(backfill_floor, reconcile_cutoff)
         for id_, source in self.settings.sources.items():
             guild = self.get_guild(source.server_id)
             if guild is None or guild.unavailable:
@@ -146,47 +154,39 @@ class Bot(discord.Client):
                 if isinstance(channel, discord.TextChannel):
                     await self.sync_channel(channel)
                 else:
-                    self.rename(channel)
+                    self.archive.register(self.stream(channel), backfill_floor)
             except discord.NotFound:
-                with self.archive.db:
-                    self.archive.drop_stream(id_, children=True)
+                self.archive.drop_stream(id_, children=True)
                 continue
-            except discord.HTTPException as error:
+            except NETWORK_ERRORS as error:
                 LOG.warning("Cannot sync channel %s: %s", id_, error)
                 continue
 
             if guild.id not in active_by_server:
                 try:
                     active_by_server[guild.id] = await guild.active_threads()
-                except discord.HTTPException as error:
+                except NETWORK_ERRORS as error:
                     LOG.warning("Cannot list active threads in server %s: %s", guild.id, error)
                     active_by_server[guild.id] = guild.threads
             threads = {thread.id: thread for thread in active_by_server[guild.id] if thread.parent_id == id_}
-            cutoff = snowflake_days_ago(max(self.settings.backfill_days, self.settings.reconcile_days))
             try:
                 async for thread in channel.archived_threads(limit=None):
                     if discord.utils.time_snowflake(thread.archive_timestamp) < cutoff:
                         break
                     threads[thread.id] = thread
-            except discord.HTTPException as error:
+            except NETWORK_ERRORS as error:
                 LOG.warning("Cannot list archived threads in channel %s: %s", id_, error)
 
-            for thread_id in sorted(threads.keys() | self.archive.threads(id_)):
+            tracked = self.archive.tracked_threads(id_, reconcile_cutoff, backfill_floor)
+            for thread_id in sorted(threads.keys() | tracked):
                 try:
                     thread = threads.get(thread_id) or await guild.fetch_channel(thread_id)
                     if isinstance(thread, discord.Thread) and self.stream(thread):
                         await self.sync_channel(thread, channel)
                 except discord.NotFound:
-                    with self.archive.db:
-                        self.archive.drop_stream(thread_id)
-                except discord.HTTPException as error:
+                    self.archive.drop_stream(thread_id)
+                except NETWORK_ERRORS as error:
                     LOG.warning("Cannot sync thread %s: %s", thread_id, error)
-
-    def rename(self, channel) -> None:
-        stream = self.stream(channel)
-        if stream:
-            with self.archive.db:
-                self.archive.register(stream, self.backfill_floor())
 
     async def work(self) -> None:
         self.archive.publish(rebuild=True)
@@ -199,22 +199,42 @@ class Bot(discord.Client):
                     self.archive.publish()
                 deadline = loop.time() + SYNC_INTERVAL
             try:
-                job = await asyncio.wait_for(self.jobs.get(), deadline - loop.time())
+                job = await asyncio.wait_for(self.jobs.get(), max(0.0, deadline - loop.time()))
             except TimeoutError:
                 continue
 
             jobs = [job]
             jobs.extend(self.jobs.get_nowait() for _ in range(min(99, self.jobs.qsize())))
+            synced = False
             for job in jobs:
-                try:
-                    if asyncio.iscoroutinefunction(job):
+                if job == self.sync:
+                    if synced:
+                        continue
+                    synced = True
+                if inspect.iscoroutinefunction(job):
+                    try:
                         await job()
-                    else:
-                        with self.archive.db:
-                            job()
-                except discord.HTTPException as error:
-                    LOG.warning("Cannot read from Discord: %s", error)
+                    except NETWORK_ERRORS as error:
+                        LOG.warning("Cannot read from Discord: %s", error)
+                    if job == self.sync:
+                        deadline = loop.time() + SYNC_INTERVAL
+                else:
+                    job()
             self.archive.publish()
+
+    async def start(self, token: str, *, reconnect: bool = True) -> None:
+        tasks = [
+            asyncio.create_task(super().start(token, reconnect=reconnect)),
+            asyncio.create_task(self.work()),
+        ]
+        try:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                task.result()
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def readable(channel) -> bool:
@@ -242,17 +262,8 @@ def message_record(message: discord.Message) -> Message:
     )
 
 
-async def run(settings: Settings, archive: Archive, token: str) -> None:
-    async with Bot(settings, archive) as bot:
-        tasks = [asyncio.create_task(bot.start(token)), asyncio.create_task(bot.work())]
-        try:
-            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                task.result()
-        finally:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+def user_dir(variable: str, default: str) -> Path:
+    return Path(os.environ.get(variable) or Path.home() / default) / "discord-md"
 
 
 def main() -> None:
@@ -275,8 +286,6 @@ def main() -> None:
             except BlockingIOError:
                 parser.exit(1, "discord-md already uses this state directory\n")
             with closing(sqlite3.connect(state_dir / "archive.sqlite3")) as db:
-                asyncio.run(run(settings, Archive(db, settings), token))
-    except KeyboardInterrupt:
-        pass
-    except (OSError, ValueError, sqlite3.Error, discord.DiscordException) as error:
+                Bot(settings, Archive(db, settings)).run(token, log_handler=None)
+    except (OSError, ValueError, sqlite3.Error, discord.DiscordException, aiohttp.ClientError) as error:
         parser.exit(1, f"discord-md: {error}\n")
